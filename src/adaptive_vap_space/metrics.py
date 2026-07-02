@@ -35,8 +35,8 @@ def metric_dict(df: pd.DataFrame, threshold: float) -> dict:
     y_pred = (y_score >= threshold).astype(int)
     pw, rw, fw, _ = precision_recall_fscore_support(y_true, y_pred, average="weighted", zero_division=0)
     pm, rm, fm, _ = precision_recall_fscore_support(y_true, y_pred, average="macro", zero_division=0)
-    pcls, rcls, fcls, _ = precision_recall_fscore_support(y_true, y_pred, labels=[0,1], average=None, zero_division=0)
-    cm = confusion_matrix(y_true, y_pred, labels=[0,1])
+    pcls, rcls, fcls, _ = precision_recall_fscore_support(y_true, y_pred, labels=[0, 1], average=None, zero_division=0)
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     return {
         "n_frames": int(len(df)),
         "n_pos": int((y_true == 1).sum()),
@@ -50,7 +50,7 @@ def metric_dict(df: pd.DataFrame, threshold: float) -> dict:
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "precision_weighted": float(pw),
         "recall_weighted": float(rw),
-        "tn": int(cm[0,0]), "fp": int(cm[0,1]), "fn": int(cm[1,0]), "tp": int(cm[1,1]),
+        "tn": int(cm[0, 0]), "fp": int(cm[0, 1]), "fn": int(cm[1, 0]), "tp": int(cm[1, 1]),
     }
 
 
@@ -70,28 +70,61 @@ def make_val_folds(keys: list[str], k: int = 5, seed: int = 42) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def evaluate(cfg: dict, protocol: str = "val_5fold") -> None:
+def build_protocol_rows(events: pd.DataFrame, cfg: dict, protocol: str) -> tuple[pd.DataFrame, str, str]:
+    """Attach calibration/evaluation labels for the requested protocol.
+
+    All protocols split by interaction_key, never by frame/event row. `val_5fold`
+    is for development diagnostics. `dev_to_test` is the final held-out protocol:
+    calibrate thresholds on val and evaluate once on test.
+    """
+    if protocol == "val_5fold":
+        rows = events[events["project_split"] == "val"].copy()
+        if rows.empty:
+            raise ValueError("No val rows found for val_5fold. Build project splits before evaluation.")
+        folds = make_val_folds(rows["interaction_key"].unique().tolist(), k=5, seed=int(get(cfg, "splits.seed", 42)))
+        rows = rows.merge(folds, on="interaction_key", how="left")
+        return rows, "calib", "test"
+
+    if protocol == "dev_to_test":
+        rows = events[events["project_split"].isin(["val", "test"])].copy()
+        rows["fold"] = 0
+        rows["split"] = rows["project_split"].map({"val": "calib", "test": "test"})
+        n_calib = rows.loc[rows["split"] == "calib", "interaction_key"].nunique()
+        n_test = rows.loc[rows["split"] == "test", "interaction_key"].nunique()
+        if n_calib == 0 or n_test == 0:
+            raise ValueError(
+                "dev_to_test requires both val and test event rows. "
+                f"Found val/calib interactions={n_calib}, test interactions={n_test}."
+            )
+        return rows, "calib", "test"
+
+    raise ValueError(f"Unknown protocol: {protocol}")
+
+
+def protocol_split_counts(rows: pd.DataFrame) -> pd.DataFrame:
+    """Summarize how many rows/interactions each protocol split uses."""
+    if rows.empty:
+        return pd.DataFrame()
+    return (
+        rows.groupby(["task", "split"], dropna=False)
+        .agg(
+            n_rows=("label", "size"),
+            n_interactions=("interaction_key", "nunique"),
+            n_pos=("label", lambda s: int((s.astype(int) == 1).sum())),
+            n_neg=("label", lambda s: int((s.astype(int) == 0).sum())),
+        )
+        .reset_index()
+    )
+
+
+def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
     """Evaluate event rows using calibrated thresholds."""
     events_csv = Path(get(cfg, "outputs.events_csv", "outputs/events/event_predictions.csv"))
     events = pd.read_csv(events_csv)
     out_root = Path(get(cfg, "outputs.metrics_root", "outputs/metrics")) / protocol
     out_root.mkdir(parents=True, exist_ok=True)
 
-    if protocol == "val_5fold":
-        rows = events[events["project_split"] == "val"].copy()
-        if rows.empty:
-            print("No val rows found; falling back to all rows for smoke testing.")
-            rows = events.copy()
-        folds = make_val_folds(rows["interaction_key"].unique().tolist(), k=5, seed=int(get(cfg, "splits.seed", 42)))
-        rows = rows.merge(folds, on="interaction_key", how="left")
-        calib_split, eval_split = "calib", "test"
-    elif protocol == "dev_to_test":
-        rows = events[events["project_split"].isin(["val", "test"])].copy()
-        rows["fold"] = 0
-        rows["split"] = rows["project_split"].map({"val": "calib", "test": "test"})
-        calib_split, eval_split = "calib", "test"
-    else:
-        raise ValueError(f"Unknown protocol: {protocol}")
+    rows, calib_split, eval_split = build_protocol_rows(events, cfg, protocol)
 
     threshold_rows = []
     metric_rows = []
@@ -120,10 +153,18 @@ def evaluate(cfg: dict, protocol: str = "val_5fold") -> None:
         table = table.merge(sh, on="fold", how="left")
     summary = metrics.groupby("task").agg({"weighted_f1": ["mean", "std"], "positive_f1": ["mean", "std"], "n_frames": "sum"}).reset_index() if not metrics.empty else pd.DataFrame()
 
+    split_counts = protocol_split_counts(rows)
+
+    write_csv(out_root / "protocol_split_counts.csv", split_counts)
     write_csv(out_root / "thresholds.csv", thresholds)
     write_csv(out_root / "fold_metrics.csv", metrics)
     write_csv(out_root / "event_predictions_eval.csv", eval_rows)
     write_csv(out_root / "table1_style_by_fold.csv", table)
     write_csv(out_root / "task_metrics.csv", summary)
-    write_json(out_root / "summary.json", {"protocol": protocol, "n_event_rows": int(len(events)), "n_eval_rows": int(len(eval_rows))})
+    write_json(out_root / "summary.json", {
+        "protocol": protocol,
+        "n_event_rows": int(len(events)),
+        "n_protocol_rows": int(len(rows)),
+        "n_eval_rows": int(len(eval_rows)),
+    })
     print(f"Wrote metrics to {out_root}")
