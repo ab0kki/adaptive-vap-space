@@ -108,6 +108,9 @@ def build_datastore(cfg: dict) -> None:
             cand for cand in candidates
             if str(cand.interaction_key).split("_", 1)[0] in allowed_vendors_pre
         ]
+
+    if bool(get(cfg, "selection.require_exactly_two_participants", True)):
+        candidates = [cand for cand in candidates if cand.n_participants_available == 2]
     seed = int(get(cfg, "dataset.seed", get(cfg, "project.seed", 42)))
     if bool(get(cfg, "dataset.shuffle_candidates", True)):
         rng = random.Random(seed)

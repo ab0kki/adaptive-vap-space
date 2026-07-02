@@ -70,3 +70,4 @@ selection:
   allowed_labels:
   - naturalistic
   - improvised
+  require_exactly_two_participants: true

@@ -46,17 +46,20 @@ def validate_vap_json(path: str | Path) -> tuple[bool, str, dict]:
 
 
 def load_prediction_arrays(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load `probs`, `p_now`, and `p_future` arrays as `(T, ...)`.
+    """Load public VAP arrays and remove only the known batch dimension.
 
-    Public VAP JSONs may serialize arrays as `(2,T)` for p_now/p_future or `(T,2)`
-    depending on version. This function normalizes to `(T,2)`.
+    Public VAP run.py writes:
+    - probs: (1, T, 256)
+    - p_now: (1, T, 2)
+    - p_future: batch-first array
+
+    Returns probs as (T, 256), p_now as (T, 2), and p_future with batch removed.
     """
     d = load_json_maybe_gz(path)
     probs = np.asarray(d["probs"], dtype=float)
     p_now = np.asarray(d["p_now"], dtype=float)
     p_future = np.asarray(d["p_future"], dtype=float)
 
-    # Public VAP run.py writes [1,T,*]. Remove only this known batch dimension.
     if probs.ndim == 3 and probs.shape[0] == 1:
         probs = probs[0]
     if p_now.ndim == 3 and p_now.shape[0] == 1:
@@ -64,19 +67,15 @@ def load_prediction_arrays(path: str | Path) -> tuple[np.ndarray, np.ndarray, np
     if p_future.ndim >= 3 and p_future.shape[0] == 1:
         p_future = p_future[0]
 
-    if p_now.ndim == 2 and p_now.shape[0] == 2 and p_now.shape[1] != 2:
-        p_now = p_now.T
-    if p_future.ndim == 2 and p_future.shape[0] == 2 and p_future.shape[1] != 2:
-        p_future = p_future.T
-    if probs.ndim == 3 and probs.shape[0] == 2 and probs.shape[1] == len(p_now):
-        # Some outputs may be (2,T,256); average channels if present.
-        probs = probs.mean(axis=0)
-    if probs.ndim == 3 and probs.shape[1] == 1:
-        probs = probs[:, 0, :]
-    if probs.ndim != 2:
-        probs = probs.reshape((len(p_now), -1))
+    if probs.ndim != 2 or probs.shape[1] != 256:
+        raise ValueError(f"Unexpected probs shape after batch removal: {probs.shape}")
+    if p_now.ndim != 2 or p_now.shape[1] != 2:
+        raise ValueError(f"Unexpected p_now shape after batch removal: {p_now.shape}")
+    if probs.shape[0] != p_now.shape[0]:
+        raise ValueError(f"Time mismatch probs={probs.shape[0]} p_now={p_now.shape[0]}")
+    if p_future.shape[0] != p_now.shape[0]:
+        raise ValueError(f"Time mismatch p_future={p_future.shape[0]} p_now={p_now.shape[0]}")
     return probs, p_now, p_future
-
 
 def backchannel_prob_from_probs(probs: np.ndarray) -> np.ndarray:
     """Reconstruct a simple BC probability from 256-state VAP probabilities.

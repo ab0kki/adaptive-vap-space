@@ -9,7 +9,10 @@ dataset:
   target_kept_interactions: 3
   max_candidate_interactions: 50
   shuffle_candidates: true
-  preferred_vendors_only: true
+  preferred_vendors_only: false
+  labels:
+  - naturalistic
+  - improvised
 external:
   seamless_repo: external/seamless_interaction
   vap_repo: external/VoiceActivityProjection
@@ -60,3 +63,10 @@ download:
   retries: 3
   timeout_sec: 60
   chunk_size_mb: 4
+selection:
+  require_exactly_two_participants: true
+  allowed_vendors:
+  - V00
+  allowed_labels:
+  - naturalistic
+  - improvised

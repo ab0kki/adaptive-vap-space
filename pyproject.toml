@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Research-grade Seamless Interaction to VAP baseline pipeline for adaptive VAP prototyping."
 requires-python = ">=3.10"
 dependencies = [
+    "torchaudio",
+    "torch",
     "numpy",
     "pandas",
     "matplotlib",
