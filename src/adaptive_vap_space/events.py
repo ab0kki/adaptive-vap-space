@@ -263,7 +263,11 @@ def extract_events(cfg: dict) -> None:
     for _, row in merged.iterrows():
         if str(row.get("status", "")).startswith("failed"):
             continue
-        pred_path = Path(row["prediction_path"])
+        vap_root = Path(get(cfg, "vap.output_root", "outputs/vap"))
+        pred_path = Path(str(row.get("prediction_path", "")))
+        pred_rel = str(row.get("prediction_relpath", ""))
+        if (not pred_path.exists()) and pred_rel and pred_rel != "nan":
+            pred_path = vap_root / pred_rel
         probs, p_now, p_future = load_prediction_arrays(pred_path)
         n_frames = len(p_now)
         vad_a, _ = read_vad_segments(resolve_under(dataset_root, row["vad_a_relpath"]))
