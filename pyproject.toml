@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaptive-vap-space"
+version = "0.1.0"
+description = "Research-grade Seamless Interaction to VAP baseline pipeline for adaptive VAP prototyping."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "soundfile",
+    "librosa",
+    "scipy",
+    "tqdm",
+    "pyyaml",
+    "requests",
+    "scikit-learn",
+    "torchcodec",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

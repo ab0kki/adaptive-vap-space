@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments / secrets
+.venv/
+.env
+.env.*
+
+# Data and outputs: never commit corpora, generated WAVs, predictions, checkpoints
+/data/
+/outputs/
+/external/
+*.wav
+*.mp4
+*.jsonl
+*.json.gz
+*.npy
+*.npz
+*.pt
+*.ckpt
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Mac
+.DS_Store
+python310/
+.vscode/
+
+# Local Python environments
+.venv/
+python310/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local data and generated outputs
+data/datastore/
+data/raw/
+data/processed/
+outputs/
+
+# External cloned repositories / model assets
+external/
+checkpoints/
+*.pt
+*.ckpt
+*.pth
+
+# Audio / prediction artifacts
+*.wav
+*.flac
+*.mp3
+*.json.gz
+*.json.gz.part
+
+# Local editor settings
+.vscode/
+
+# Local patch scratch
+patch_backups/
+tools/pre300_fix.py

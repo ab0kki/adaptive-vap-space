@@ -1,0 +1,62 @@
+project:
+  name: adaptive-vap-space-local-debug
+  seed: 17
+dataset:
+  root: data/datastore
+  label: naturalistic
+  source_splits:
+  - dev
+  target_kept_interactions: 3
+  max_candidate_interactions: 50
+  shuffle_candidates: true
+  preferred_vendors_only: true
+external:
+  seamless_repo: external/seamless_interaction
+  vap_repo: external/VoiceActivityProjection
+  vap_checkpoint: external/VoiceActivityProjection/example/VAP_3mmz3t0u_50Hz_ad20s_134-epoch9-val_2.56.pt
+modalities:
+  require_audio: true
+  require_vad: true
+  download_transcript: true
+  require_transcript: false
+  download_video: false
+filters:
+  min_duration_sec: 20
+  max_duration_sec: 420
+  max_audio_duration_diff_sec: 2.0
+  min_speaker_fraction: 0.15
+  max_speaker_fraction: 0.85
+  min_speaker_vad_ratio: 0.01
+  min_total_speech_ratio: 0.03
+  max_overlap_ratio: 0.5
+  max_silence_ratio: 0.95
+  max_vad_timestamp_oob_fraction: 0.05
+  min_vad_segments: 3
+splits:
+  train: 0.6
+  val: 0.2
+  test: 0.2
+  seed: 17
+audio:
+  sample_rate: 16000
+  stereo_subdir: processed/stereo_wav
+vap:
+  frame_hz: 50
+  output_root: outputs/vap
+  gzip: true
+  overwrite: false
+outputs:
+  root: outputs
+  events_csv: outputs/events/event_predictions.csv
+  metrics_root: outputs/metrics
+  eda_root: outputs/eda
+storage:
+  staging_dirname: _staging
+  keep_rejected_downloads: false
+  delete_raw_audio_after_stereo: false
+  delete_transcripts_after_build: false
+download:
+  overwrite: false
+  retries: 3
+  timeout_sec: 60
+  chunk_size_mb: 4
