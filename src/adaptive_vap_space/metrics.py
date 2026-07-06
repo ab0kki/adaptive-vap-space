@@ -156,6 +156,53 @@ def protocol_split_counts(rows: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+
+def event_level_metric_rows(eval_rows: pd.DataFrame, thresholds: pd.DataFrame) -> pd.DataFrame:
+    """Compute event-level metrics using the already-calibrated frame-level thresholds.
+
+    Frame-level rows are grouped by event_id. The event score is the mean score
+    across that event window. This does not replace frame-level metrics; it adds
+    a more interpretable event-level diagnostic.
+    """
+    if eval_rows.empty:
+        return pd.DataFrame()
+
+    group_cols = [
+        "fold",
+        "task",
+        "interaction_key",
+        "project_split",
+        "source_event",
+        "event_id",
+        "speaker",
+        "positive_class",
+    ]
+    group_cols = [c for c in group_cols if c in eval_rows.columns]
+
+    ev = (
+        eval_rows.groupby(group_cols, dropna=False)
+        .agg(
+            label=("label", "first"),
+            score=("score", "mean"),
+            n_frames=("score", "size"),
+            time_s=("time_s", "mean"),
+        )
+        .reset_index()
+    )
+
+    rows = []
+    for _, th in thresholds.iterrows():
+        fold = th["fold"]
+        task = th["task"]
+        threshold = float(th["threshold"])
+        g = ev[(ev["fold"] == fold) & (ev["task"] == task)].copy()
+        m = metric_dict(g, threshold)
+        m.update({"fold": fold, "task": task, "unit": "event_mean_score"})
+        rows.append(m)
+
+    return pd.DataFrame(rows)
+
+
 def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
     """Evaluate event rows using calibrated thresholds."""
     events_csv = Path(get(cfg, "outputs.events_csv", "outputs/events/event_predictions.csv"))
@@ -213,8 +260,13 @@ def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
         metrics.groupby("task")
         .agg({
             "weighted_f1": ["mean", "std"],
+            "macro_f1": ["mean", "std"],
+            "positive_precision": ["mean", "std"],
+            "positive_recall": ["mean", "std"],
             "positive_f1": ["mean", "std"],
             "n_frames": "sum",
+            "n_pos": "sum",
+            "n_neg": "sum",
         })
         .reset_index()
         if not metrics.empty
@@ -223,9 +275,12 @@ def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
 
     split_counts = protocol_split_counts(rows)
 
+    event_metrics = event_level_metric_rows(eval_rows, thresholds)
+
     write_csv(out_root / "protocol_split_counts.csv", split_counts)
     write_csv(out_root / "thresholds.csv", thresholds)
     write_csv(out_root / "fold_metrics.csv", metrics)
+    write_csv(out_root / "event_level_metrics.csv", event_metrics)
     write_csv(out_root / "event_predictions_eval.csv", eval_rows)
     write_csv(out_root / "table1_style_by_fold.csv", table)
     write_csv(out_root / "task_metrics.csv", summary)

@@ -94,6 +94,11 @@ def extract_backchannel_events(va: np.ndarray, params: dict) -> list[dict]:
                 continue
             if va[e:post_e, bc_speaker].any():
                 continue
+            # Guard against empty pre-window at the start of an interaction.
+            # Without this, numpy warns on mean(empty). An empty pre-window cannot
+            # satisfy the "main speaker active before BC" condition.
+            if pre_s >= s:
+                continue
             if va[pre_s:s, main].mean() < main_min:
                 continue
             events.append({
