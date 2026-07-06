@@ -12,32 +12,42 @@ from .reports import write_csv, write_json
 
 DEFAULT_OBJECTIVES = ["weighted_f1", "macro_f1", "positive_f1", "balanced_accuracy"]
 
+# Main threshold-selection objective for every reported task.
+# This avoids weighted-F1 majority-class dominance while keeping one consistent
+# calibration rule across S/H, S-pred, BC-pred, and S/L.
+PRIMARY_THRESHOLD_OBJECTIVE = "macro_f1"
+
 
 def threshold_candidates(y_score) -> np.ndarray:
-    """Create deterministic candidate thresholds using the original quantile grid."""
+    """Create deterministic candidate thresholds using a quantile grid."""
     y_score = np.asarray(y_score, dtype=float)
     if len(y_score) == 0:
         return np.asarray([0.5], dtype=float)
+
     candidates = np.unique(np.quantile(y_score, np.linspace(0.02, 0.98, 97)))
     if len(candidates) == 0:
         candidates = np.asarray([0.5], dtype=float)
+
     return candidates.astype(float)
 
 
-def choose_threshold(y_true, y_score, objective: str = "weighted_f1") -> tuple[float, float]:
+def choose_threshold(y_true, y_score, objective: str = PRIMARY_THRESHOLD_OBJECTIVE) -> tuple[float, float]:
     """Choose threshold maximizing an objective on calibration data."""
     y_true = np.asarray(y_true).astype(int)
     y_score = np.asarray(y_score).astype(float)
+
     if len(y_true) == 0 or len(np.unique(y_true)) < 2:
         return 0.5, float("nan")
 
     best_t, best_value = 0.5, -1.0
     df = pd.DataFrame({"label": y_true, "score": y_score})
+
     for t in threshold_candidates(y_score):
         m = metric_dict(df, float(t))
         value = float(m.get(objective, np.nan))
         if np.isfinite(value) and value > best_value:
             best_t, best_value = float(t), value
+
     return best_t, best_value
 
 
@@ -77,6 +87,7 @@ def metric_dict(df: pd.DataFrame, threshold: float) -> dict:
     pcls, rcls, fcls, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=[0, 1], average=None, zero_division=0
     )
+
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1])
 
@@ -106,19 +117,22 @@ def metric_dict(df: pd.DataFrame, threshold: float) -> dict:
 
 
 def threshold_sweep_rows(calib: pd.DataFrame, test: pd.DataFrame, fold, task) -> list[dict]:
-    """Return calibration and test metrics over a shared threshold grid."""
+    """Return calibration and test metrics over the calibration threshold grid."""
     rows = []
+
     for t in threshold_candidates(calib["score"]):
         for split_name, split_df in [("calib", calib), ("test", test)]:
             m = metric_dict(split_df, float(t))
             m.update({"fold": fold, "task": task, "split": split_name})
             rows.append(m)
+
     return rows
 
 
 def objective_threshold_rows(calib: pd.DataFrame, test: pd.DataFrame, fold, task) -> list[dict]:
     """Evaluate test metrics using thresholds selected by several calibration objectives."""
     rows = []
+
     for objective in DEFAULT_OBJECTIVES:
         t, calib_value = choose_threshold(calib["label"], calib["score"], objective=objective)
         m = metric_dict(test, t)
@@ -129,12 +143,14 @@ def objective_threshold_rows(calib: pd.DataFrame, test: pd.DataFrame, fold, task
             "calib_objective_value": calib_value,
         })
         rows.append(m)
+
     return rows
 
 
 def make_val_folds(keys: list[str], k: int = 5, seed: int = 42) -> pd.DataFrame:
     """Create k-fold calibration/eval rows by interaction key."""
     keys = np.array(sorted(set(keys)))
+
     if len(keys) < k:
         k = max(1, len(keys))
 
@@ -151,6 +167,7 @@ def make_val_folds(keys: list[str], k: int = 5, seed: int = 42) -> pd.DataFrame:
                 "fold": fold_id,
                 "split": "test" if key in test else "calib",
             })
+
     return pd.DataFrame(rows)
 
 
@@ -163,6 +180,7 @@ def build_protocol_rows(events: pd.DataFrame, cfg: dict, protocol: str) -> tuple
         rows = events[events["project_split"] == "val"].copy()
         if rows.empty:
             raise ValueError("No val rows found for val_5fold. Build project splits before evaluation.")
+
         folds = make_val_folds(
             rows["interaction_key"].unique().tolist(),
             k=5,
@@ -178,6 +196,7 @@ def build_protocol_rows(events: pd.DataFrame, cfg: dict, protocol: str) -> tuple
 
         n_calib = rows.loc[rows["split"] == "calib", "interaction_key"].nunique()
         n_test = rows.loc[rows["split"] == "test", "interaction_key"].nunique()
+
         if n_calib == 0 or n_test == 0:
             raise ValueError(
                 "dev_to_test requires both val and test event rows. "
@@ -220,6 +239,7 @@ def event_level_metric_rows(eval_rows: pd.DataFrame, thresholds: pd.DataFrame) -
         "event_id",
         "speaker",
         "positive_class",
+        "score_variant",
     ]
     group_cols = [c for c in group_cols if c in eval_rows.columns]
 
@@ -239,6 +259,7 @@ def event_level_metric_rows(eval_rows: pd.DataFrame, thresholds: pd.DataFrame) -
         fold = th["fold"]
         task = th["task"]
         threshold = float(th["threshold"])
+
         g = ev[(ev["fold"] == fold) & (ev["task"] == task)].copy()
         m = metric_dict(g, threshold)
         m.update({"fold": fold, "task": task, "unit": "event_mean_score"})
@@ -267,14 +288,19 @@ def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
         calib = g[g["split"] == calib_split]
         test = g[g["split"] == eval_split]
 
-        t, calib_f1 = choose_threshold(calib["label"], calib["score"], objective="weighted_f1")
+        t, calib_value = choose_threshold(
+            calib["label"],
+            calib["score"],
+            objective=PRIMARY_THRESHOLD_OBJECTIVE,
+        )
+
         threshold_rows.append({
             "fold": fold,
             "task": task,
             "threshold": t,
-            "threshold_objective": "weighted_f1",
+            "threshold_objective": PRIMARY_THRESHOLD_OBJECTIVE,
             "n_calib_frames": len(calib),
-            "best_calib_weighted_f1": calib_f1,
+            "best_calib_objective_value": calib_value,
         })
 
         m = metric_dict(test, t)
@@ -344,6 +370,7 @@ def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
         "n_protocol_rows": int(len(rows)),
         "n_eval_rows": int(len(eval_rows)),
         "threshold_objectives": DEFAULT_OBJECTIVES,
+        "primary_threshold_objective": PRIMARY_THRESHOLD_OBJECTIVE,
     })
 
     print(f"Wrote metrics to {out_root}")
