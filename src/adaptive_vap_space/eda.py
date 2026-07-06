@@ -13,6 +13,15 @@ from .residuals import add_residual_columns
 from .reports import write_csv, write_json
 
 
+INTERACTION_FEATURES = [
+    "duration_sec",
+    "speaker_a_fraction",
+    "total_speech_ratio",
+    "overlap_ratio",
+    "silence_ratio",
+]
+
+
 def _hist(df: pd.DataFrame, col: str, out_path: Path, title: str) -> None:
     if col not in df.columns or df.empty:
         return
@@ -28,11 +37,7 @@ def _hist(df: pd.DataFrame, col: str, out_path: Path, title: str) -> None:
 
 
 def _load_canonical_splits(root: Path) -> pd.DataFrame:
-    """Load canonical interaction split assignments.
-
-    project_splits.csv is preferred because it is the final stable split file.
-    stereo_manifest.csv is the fallback because event extraction uses it.
-    """
+    """Load canonical interaction split assignments."""
     split_path = root / "manifests" / "project_splits.csv"
     stereo_path = root / "manifests" / "stereo_manifest.csv"
 
@@ -49,17 +54,7 @@ def _load_canonical_splits(root: Path) -> pd.DataFrame:
     return pd.DataFrame(columns=["interaction_key", "canonical_project_split"])
 
 
-def eda_dataset(cfg: dict) -> None:
-    """Analyze datastore quality and save simple reports/plots.
-
-    The interaction manifest can contain stale split labels from incremental
-    building. For split-aware EDA, use the canonical final split from
-    project_splits.csv or stereo_manifest.csv.
-    """
-    root = Path(get(cfg, "dataset.root", "data/datastore"))
-    out = Path(get(cfg, "outputs.eda_root", "outputs/eda")) / "dataset"
-    out.mkdir(parents=True, exist_ok=True)
-
+def _load_interaction_quality_with_canonical_split(root: Path) -> pd.DataFrame:
     interactions = pd.read_csv(root / "manifests" / "interaction_manifest.csv")
     splits = _load_canonical_splits(root)
 
@@ -70,15 +65,24 @@ def eda_dataset(cfg: dict) -> None:
         interactions["project_split"] = interactions["canonical_project_split"].combine_first(
             interactions.get("project_split_raw", pd.Series(index=interactions.index, dtype=object))
         )
+    return interactions
 
-        mismatch_cols = ["interaction_key", "project_split_raw", "canonical_project_split"]
-        if "project_split_raw" in interactions.columns:
-            mismatches = interactions[
-                interactions["project_split_raw"].notna()
-                & interactions["canonical_project_split"].notna()
-                & (interactions["project_split_raw"] != interactions["canonical_project_split"])
-            ][mismatch_cols]
-            write_csv(out / "split_mismatches.csv", mismatches)
+
+def eda_dataset(cfg: dict) -> None:
+    """Analyze datastore quality and save simple reports/plots."""
+    root = Path(get(cfg, "dataset.root", "data/datastore"))
+    out = Path(get(cfg, "outputs.eda_root", "outputs/eda")) / "dataset"
+    out.mkdir(parents=True, exist_ok=True)
+
+    interactions = _load_interaction_quality_with_canonical_split(root)
+
+    if "project_split_raw" in interactions.columns and "canonical_project_split" in interactions.columns:
+        mismatches = interactions[
+            interactions["project_split_raw"].notna()
+            & interactions["canonical_project_split"].notna()
+            & (interactions["project_split_raw"] != interactions["canonical_project_split"])
+        ][["interaction_key", "project_split_raw", "canonical_project_split"]]
+        write_csv(out / "split_mismatches.csv", mismatches)
 
     kept = interactions[interactions["keep"] == True].copy() if "keep" in interactions.columns else interactions
     write_csv(out / "interaction_quality.csv", interactions)
@@ -92,7 +96,7 @@ def eda_dataset(cfg: dict) -> None:
         summary["kept_by_project_split"] = kept["project_split"].value_counts(dropna=False).to_dict()
     write_json(out / "dataset_summary.json", summary)
 
-    for col in ["duration_sec", "speaker_a_fraction", "total_speech_ratio", "overlap_ratio", "silence_ratio"]:
+    for col in INTERACTION_FEATURES:
         _hist(kept, col, out / "plots" / f"{col}.png", col)
 
     if "project_split" in kept.columns:
@@ -121,19 +125,68 @@ def _merge_event_durations(df: pd.DataFrame, events_csv: Path) -> pd.DataFrame:
     return df.merge(summary, on="interaction_key", how="left")
 
 
+def _add_relative_time(df: pd.DataFrame, events_csv: Path) -> pd.DataFrame:
+    df = _merge_event_durations(df, events_csv)
+    if "duration_s" in df.columns and "time_s" in df.columns:
+        df["relative_time"] = (df["time_s"] / df["duration_s"]).clip(lower=0, upper=1)
+        df["relative_time_bin"] = pd.cut(
+            df["relative_time"],
+            bins=[i / 10 for i in range(11)],
+            include_lowest=True,
+        )
+        df["interaction_half"] = pd.Series("late", index=df.index)
+        df.loc[df["relative_time"] < 0.5, "interaction_half"] = "early"
+    return df
+
+
+def _add_speaker_ids(df: pd.DataFrame, root: Path) -> pd.DataFrame:
+    stereo_path = root / "manifests" / "stereo_manifest.csv"
+    if not stereo_path.exists() or "speaker" not in df.columns:
+        return df
+
+    stereo = pd.read_csv(stereo_path)
+    cols = [c for c in ["interaction_key", "speaker_a", "speaker_b"] if c in stereo.columns]
+    if len(cols) < 3:
+        return df
+
+    df = df.merge(stereo[cols].drop_duplicates("interaction_key"), on="interaction_key", how="left")
+
+    def _speaker_id(row):
+        try:
+            sp = int(row["speaker"])
+        except Exception:
+            return None
+        if sp == 0:
+            return row.get("speaker_a")
+        if sp == 1:
+            return row.get("speaker_b")
+        return None
+
+    df["speaker_id"] = df.apply(_speaker_id, axis=1)
+    return df
+
+
+def _add_interaction_features(df: pd.DataFrame, root: Path) -> pd.DataFrame:
+    try:
+        q = _load_interaction_quality_with_canonical_split(root)
+    except Exception:
+        return df
+
+    cols = ["interaction_key"] + [c for c in INTERACTION_FEATURES if c in q.columns]
+    q = q[cols].drop_duplicates("interaction_key")
+    return df.merge(q, on="interaction_key", how="left")
+
+
 def eda_vap_errors(cfg: dict) -> None:
-    """Analyze residuals over interaction time."""
+    """Analyze residuals over interaction time and speakers."""
+    root = Path(get(cfg, "dataset.root", "data/datastore"))
     events_csv = Path(get(cfg, "outputs.events_csv", "outputs/events/event_predictions.csv"))
     out = Path(get(cfg, "outputs.eda_root", "outputs/eda")) / "vap_errors"
     out.mkdir(parents=True, exist_ok=True)
 
     df = add_residual_columns(pd.read_csv(events_csv))
-    df = _merge_event_durations(df, events_csv)
-
-    if "duration_s" in df.columns:
-        df["relative_time"] = df["time_s"] / df["duration_s"]
-        df["relative_time"] = df["relative_time"].clip(lower=0, upper=1)
-        df["relative_time_bin"] = pd.cut(df["relative_time"], bins=[i / 10 for i in range(11)], include_lowest=True)
+    df = _add_relative_time(df, events_csv)
+    df = _add_speaker_ids(df, root)
 
     write_csv(out / "residual_rows.csv", df)
 
@@ -155,6 +208,30 @@ def eda_vap_errors(cfg: dict) -> None:
             .reset_index()
         )
         write_csv(out / "relative_time_residual_summary.csv", rel_summary)
+
+    if "speaker_id" in df.columns:
+        speaker_summary = (
+            df.groupby(["task", "speaker_id"], dropna=False)
+            .agg(
+                mean_abs_residual=("abs_residual", "mean"),
+                mean_squared_residual=("squared_residual", "mean"),
+                n_rows=("label", "size"),
+                n_interactions=("interaction_key", "nunique"),
+            )
+            .reset_index()
+        )
+        write_csv(out / "speaker_residual_summary.csv", speaker_summary)
+
+    if "interaction_half" in df.columns:
+        half_summary = (
+            df.groupby(["task", "interaction_half"], dropna=False)
+            .agg(
+                mean_abs_residual=("abs_residual", "mean"),
+                n_rows=("label", "size"),
+            )
+            .reset_index()
+        )
+        write_csv(out / "early_late_residual_summary.csv", half_summary)
 
     for task, g in df.groupby("task"):
         plt.figure()
@@ -178,8 +255,40 @@ def eda_vap_errors(cfg: dict) -> None:
     print(f"Wrote VAP error EDA to {out}")
 
 
+def _feature_bin_errors(ev: pd.DataFrame, out: Path, protocol: str) -> None:
+    rows = []
+    for feature in INTERACTION_FEATURES:
+        if feature not in ev.columns:
+            continue
+        x = ev[feature]
+        if x.notna().nunique() < 4:
+            continue
+        try:
+            bins = pd.qcut(x, q=4, duplicates="drop")
+        except Exception:
+            continue
+        tmp = ev.copy()
+        tmp["feature"] = feature
+        tmp["feature_bin"] = bins.astype(str)
+        g = (
+            tmp.groupby(["task", "feature", "feature_bin"], dropna=False)
+            .agg(
+                n_rows=("label", "size"),
+                n_interactions=("interaction_key", "nunique"),
+                error_rate=("is_error", "mean"),
+                positive_rate=("label", "mean"),
+                mean_score=("score", "mean"),
+            )
+            .reset_index()
+        )
+        rows.append(g)
+    if rows:
+        write_csv(out / f"classification_error_by_interaction_feature_{protocol}.csv", pd.concat(rows, ignore_index=True))
+
+
 def eda_event_errors(cfg: dict) -> None:
     """Summarize residuals and classification errors by event source/task."""
+    root = Path(get(cfg, "dataset.root", "data/datastore"))
     events_csv = Path(get(cfg, "outputs.events_csv", "outputs/events/event_predictions.csv"))
     out = Path(get(cfg, "outputs.eda_root", "outputs/eda")) / "event_errors"
     out.mkdir(parents=True, exist_ok=True)
@@ -201,7 +310,11 @@ def eda_event_errors(cfg: dict) -> None:
         ev = pd.read_csv(eval_csv)
         if "pred" not in ev.columns:
             continue
+
         ev["is_error"] = ev["pred"].astype(int) != ev["label"].astype(int)
+        ev = _add_relative_time(ev, events_csv)
+        ev = _add_speaker_ids(ev, root)
+        ev = _add_interaction_features(ev, root)
 
         cls = (
             ev.groupby(["task", "source_event"], dropna=False)
@@ -223,5 +336,61 @@ def eda_event_errors(cfg: dict) -> None:
             .reset_index(name="n_rows")
         )
         write_csv(out / f"classification_confusion_by_source_{protocol}.csv", cm)
+
+        if "relative_time_bin" in ev.columns:
+            rel = (
+                ev.groupby(["task", "relative_time_bin"], observed=False)
+                .agg(
+                    n_rows=("label", "size"),
+                    n_interactions=("interaction_key", "nunique"),
+                    error_rate=("is_error", "mean"),
+                    positive_rate=("label", "mean"),
+                    mean_score=("score", "mean"),
+                )
+                .reset_index()
+            )
+            write_csv(out / f"classification_error_by_relative_time_{protocol}.csv", rel)
+
+        if "interaction_half" in ev.columns:
+            half = (
+                ev.groupby(["task", "interaction_half"], dropna=False)
+                .agg(
+                    n_rows=("label", "size"),
+                    n_interactions=("interaction_key", "nunique"),
+                    error_rate=("is_error", "mean"),
+                    positive_rate=("label", "mean"),
+                    mean_score=("score", "mean"),
+                )
+                .reset_index()
+            )
+            write_csv(out / f"classification_error_early_late_{protocol}.csv", half)
+
+        if "speaker_id" in ev.columns:
+            spk = (
+                ev.groupby(["task", "speaker_id"], dropna=False)
+                .agg(
+                    n_rows=("label", "size"),
+                    n_interactions=("interaction_key", "nunique"),
+                    error_rate=("is_error", "mean"),
+                    positive_rate=("label", "mean"),
+                    mean_score=("score", "mean"),
+                )
+                .reset_index()
+            )
+            write_csv(out / f"classification_error_by_speaker_{protocol}.csv", spk)
+
+        per_interaction = (
+            ev.groupby(["task", "interaction_key"], dropna=False)
+            .agg(
+                n_rows=("label", "size"),
+                error_rate=("is_error", "mean"),
+                positive_rate=("label", "mean"),
+                mean_score=("score", "mean"),
+            )
+            .reset_index()
+        )
+        write_csv(out / f"classification_error_by_interaction_{protocol}.csv", per_interaction)
+
+        _feature_bin_errors(ev, out, protocol)
 
     print(f"Wrote event error EDA to {out}")

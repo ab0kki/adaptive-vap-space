@@ -10,22 +10,35 @@ from .config import get
 from .reports import write_csv, write_json
 
 
-def choose_threshold(y_true, y_score) -> tuple[float, float]:
-    """Choose threshold maximizing weighted F1 on calibration data."""
+DEFAULT_OBJECTIVES = ["weighted_f1", "macro_f1", "positive_f1", "balanced_accuracy"]
+
+
+def threshold_candidates(y_score) -> np.ndarray:
+    """Create deterministic candidate thresholds using the original quantile grid."""
+    y_score = np.asarray(y_score, dtype=float)
+    if len(y_score) == 0:
+        return np.asarray([0.5], dtype=float)
+    candidates = np.unique(np.quantile(y_score, np.linspace(0.02, 0.98, 97)))
+    if len(candidates) == 0:
+        candidates = np.asarray([0.5], dtype=float)
+    return candidates.astype(float)
+
+
+def choose_threshold(y_true, y_score, objective: str = "weighted_f1") -> tuple[float, float]:
+    """Choose threshold maximizing an objective on calibration data."""
     y_true = np.asarray(y_true).astype(int)
     y_score = np.asarray(y_score).astype(float)
     if len(y_true) == 0 or len(np.unique(y_true)) < 2:
         return 0.5, float("nan")
-    candidates = np.unique(np.quantile(y_score, np.linspace(0.02, 0.98, 97)))
-    best_t, best_f1 = 0.5, -1.0
-    for t in candidates:
-        y_pred = (y_score >= t).astype(int)
-        _, _, f1, _ = precision_recall_fscore_support(
-            y_true, y_pred, average="weighted", zero_division=0
-        )
-        if f1 > best_f1:
-            best_t, best_f1 = float(t), float(f1)
-    return best_t, best_f1
+
+    best_t, best_value = 0.5, -1.0
+    df = pd.DataFrame({"label": y_true, "score": y_score})
+    for t in threshold_candidates(y_score):
+        m = metric_dict(df, float(t))
+        value = float(m.get(objective, np.nan))
+        if np.isfinite(value) and value > best_value:
+            best_t, best_value = float(t), value
+    return best_t, best_value
 
 
 def metric_dict(df: pd.DataFrame, threshold: float) -> dict:
@@ -33,10 +46,22 @@ def metric_dict(df: pd.DataFrame, threshold: float) -> dict:
     if df.empty:
         return {
             "n_frames": 0,
+            "n_pos": 0,
+            "n_neg": 0,
+            "threshold": float(threshold),
             "weighted_f1": np.nan,
             "macro_f1": np.nan,
+            "balanced_accuracy": np.nan,
+            "positive_precision": np.nan,
+            "positive_recall": np.nan,
             "positive_f1": np.nan,
             "accuracy": np.nan,
+            "precision_weighted": np.nan,
+            "recall_weighted": np.nan,
+            "tn": 0,
+            "fp": 0,
+            "fn": 0,
+            "tp": 0,
         }
 
     y_true = df["label"].astype(int).to_numpy()
@@ -46,13 +71,18 @@ def metric_dict(df: pd.DataFrame, threshold: float) -> dict:
     pw, rw, fw, _ = precision_recall_fscore_support(
         y_true, y_pred, average="weighted", zero_division=0
     )
-    pm, rm, fm, _ = precision_recall_fscore_support(
+    _, _, fm, _ = precision_recall_fscore_support(
         y_true, y_pred, average="macro", zero_division=0
     )
     pcls, rcls, fcls, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=[0, 1], average=None, zero_division=0
     )
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1])
+
+    tnr = tn / (tn + fp) if (tn + fp) else np.nan
+    tpr = tp / (tp + fn) if (tp + fn) else np.nan
+    balanced_accuracy = float(np.nanmean([tnr, tpr]))
 
     return {
         "n_frames": int(len(df)),
@@ -61,17 +91,45 @@ def metric_dict(df: pd.DataFrame, threshold: float) -> dict:
         "threshold": float(threshold),
         "weighted_f1": float(fw),
         "macro_f1": float(fm),
+        "balanced_accuracy": balanced_accuracy,
         "positive_precision": float(pcls[1]),
         "positive_recall": float(rcls[1]),
         "positive_f1": float(fcls[1]),
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "precision_weighted": float(pw),
         "recall_weighted": float(rw),
-        "tn": int(cm[0, 0]),
-        "fp": int(cm[0, 1]),
-        "fn": int(cm[1, 0]),
-        "tp": int(cm[1, 1]),
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+        "tp": tp,
     }
+
+
+def threshold_sweep_rows(calib: pd.DataFrame, test: pd.DataFrame, fold, task) -> list[dict]:
+    """Return calibration and test metrics over a shared threshold grid."""
+    rows = []
+    for t in threshold_candidates(calib["score"]):
+        for split_name, split_df in [("calib", calib), ("test", test)]:
+            m = metric_dict(split_df, float(t))
+            m.update({"fold": fold, "task": task, "split": split_name})
+            rows.append(m)
+    return rows
+
+
+def objective_threshold_rows(calib: pd.DataFrame, test: pd.DataFrame, fold, task) -> list[dict]:
+    """Evaluate test metrics using thresholds selected by several calibration objectives."""
+    rows = []
+    for objective in DEFAULT_OBJECTIVES:
+        t, calib_value = choose_threshold(calib["label"], calib["score"], objective=objective)
+        m = metric_dict(test, t)
+        m.update({
+            "fold": fold,
+            "task": task,
+            "threshold_objective": objective,
+            "calib_objective_value": calib_value,
+        })
+        rows.append(m)
+    return rows
 
 
 def make_val_folds(keys: list[str], k: int = 5, seed: int = 42) -> pd.DataFrame:
@@ -100,14 +158,6 @@ def build_protocol_rows(events: pd.DataFrame, cfg: dict, protocol: str) -> tuple
     """Attach calibration/evaluation labels for the requested protocol.
 
     All protocols split by interaction_key, never by frame/event row.
-
-    val_5fold:
-        Development/audit protocol. Uses only val rows and makes 5 interaction-
-        level folds inside val.
-
-    dev_to_test:
-        Final held-out protocol. Calibrates thresholds on val and evaluates once
-        on test.
     """
     if protocol == "val_5fold":
         rows = events[events["project_split"] == "val"].copy()
@@ -156,14 +206,8 @@ def protocol_split_counts(rows: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-
 def event_level_metric_rows(eval_rows: pd.DataFrame, thresholds: pd.DataFrame) -> pd.DataFrame:
-    """Compute event-level metrics using the already-calibrated frame-level thresholds.
-
-    Frame-level rows are grouped by event_id. The event score is the mean score
-    across that event window. This does not replace frame-level metrics; it adds
-    a more interpretable event-level diagnostic.
-    """
+    """Compute event-level metrics using already-calibrated frame-level thresholds."""
     if eval_rows.empty:
         return pd.DataFrame()
 
@@ -216,16 +260,19 @@ def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
     threshold_rows = []
     metric_rows = []
     eval_rows_out = []
+    sweep_rows = []
+    objective_rows = []
 
     for (fold, task), g in rows.groupby(["fold", "task"]):
         calib = g[g["split"] == calib_split]
         test = g[g["split"] == eval_split]
 
-        t, calib_f1 = choose_threshold(calib["label"], calib["score"])
+        t, calib_f1 = choose_threshold(calib["label"], calib["score"], objective="weighted_f1")
         threshold_rows.append({
             "fold": fold,
             "task": task,
             "threshold": t,
+            "threshold_objective": "weighted_f1",
             "n_calib_frames": len(calib),
             "best_calib_weighted_f1": calib_f1,
         })
@@ -239,9 +286,14 @@ def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
         tmp["pred"] = (tmp["score"] >= t).astype(int)
         eval_rows_out.append(tmp)
 
+        sweep_rows.extend(threshold_sweep_rows(calib, test, fold, task))
+        objective_rows.extend(objective_threshold_rows(calib, test, fold, task))
+
     thresholds = pd.DataFrame(threshold_rows)
     metrics = pd.DataFrame(metric_rows)
     eval_rows = pd.concat(eval_rows_out, ignore_index=True) if eval_rows_out else pd.DataFrame()
+    threshold_sweep = pd.DataFrame(sweep_rows)
+    objective_metrics = pd.DataFrame(objective_rows)
 
     table = metrics.pivot_table(
         index="fold",
@@ -261,6 +313,7 @@ def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
         .agg({
             "weighted_f1": ["mean", "std"],
             "macro_f1": ["mean", "std"],
+            "balanced_accuracy": ["mean", "std"],
             "positive_precision": ["mean", "std"],
             "positive_recall": ["mean", "std"],
             "positive_f1": ["mean", "std"],
@@ -274,13 +327,14 @@ def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
     )
 
     split_counts = protocol_split_counts(rows)
-
     event_metrics = event_level_metric_rows(eval_rows, thresholds)
 
     write_csv(out_root / "protocol_split_counts.csv", split_counts)
     write_csv(out_root / "thresholds.csv", thresholds)
     write_csv(out_root / "fold_metrics.csv", metrics)
     write_csv(out_root / "event_level_metrics.csv", event_metrics)
+    write_csv(out_root / "threshold_sweep.csv", threshold_sweep)
+    write_csv(out_root / "objective_threshold_metrics.csv", objective_metrics)
     write_csv(out_root / "event_predictions_eval.csv", eval_rows)
     write_csv(out_root / "table1_style_by_fold.csv", table)
     write_csv(out_root / "task_metrics.csv", summary)
@@ -289,6 +343,7 @@ def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
         "n_event_rows": int(len(events)),
         "n_protocol_rows": int(len(rows)),
         "n_eval_rows": int(len(eval_rows)),
+        "threshold_objectives": DEFAULT_OBJECTIVES,
     })
 
     print(f"Wrote metrics to {out_root}")
