@@ -1,16 +1,29 @@
 """VAP 256-state zero-shot score helpers.
 
+This module is intentionally explicit because VAP event scoring was the main
+ambiguous part of the audit.
+
 The public VAP runner writes a 256-class probability distribution, ``probs``,
-for each frame. The classes encode a two-speaker future voice-activity
-projection with four bins per speaker:
+for each frame. Each class is one possible future voice-activity pattern over a
+2-second projection window with four bins per speaker:
 
     speaker 0 bins: b0, b1, b2, b3
     speaker 1 bins: b0, b1, b2, b3
 
-This module reconstructs task-specific zero-shot scores from those 256
-probabilities. Exported ``p_now`` and ``p_future`` remain useful diagnostics,
-but the paper-style event evaluation should be based on explicit VAP class
-subsets when possible.
+The codebook index convention follows the public VAP codebook: speaker 0 bins
+come first, speaker 1 bins come second, and the first flattened element is the
+least significant bit.
+
+This module reconstructs three task-level VAP scores by summing explicit subsets
+of those 256 classes:
+
+    p_silence: next-speaker score during mutual silence, used by S/H-paper.
+    p_active:  shift-to-speaker score during active speech, used by S-pred.
+    p_bc:      backchannel score, used by BC-pred and S/L-paper.
+
+These arrays are written to event rows as ``score_variant = paper_256``. Exported
+``p_now`` and ``p_future`` remain useful diagnostics, but paper-style event
+evaluation should prioritize explicit 256-state subsets.
 """
 from __future__ import annotations
 
