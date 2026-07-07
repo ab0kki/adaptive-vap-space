@@ -1,4 +1,9 @@
-"""Threshold calibration and VAP-style metric tables."""
+"""Threshold calibration and VAP-style metric tables.
+
+Metrics are computed per task and per score_variant. This is important because
+this repository now writes both paper-style 256-state scores and diagnostic
+scores from exported VAP arrays.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -12,9 +17,9 @@ from .reports import write_csv, write_json
 
 DEFAULT_OBJECTIVES = ["weighted_f1", "macro_f1", "positive_f1", "balanced_accuracy"]
 
-# Main threshold-selection objective for every reported task.
-# This avoids weighted-F1 majority-class dominance while keeping one consistent
-# calibration rule across S/H, S-pred, BC-pred, and S/L.
+# Keep the same primary calibration rule as the previous audit notebook. The
+# objective audit still reports weighted_f1, macro_f1, positive_f1, and
+# balanced_accuracy so paper-style weighted-F1 thresholds remain inspectable.
 PRIMARY_THRESHOLD_OBJECTIVE = "macro_f1"
 
 
@@ -116,29 +121,52 @@ def metric_dict(df: pd.DataFrame, threshold: float) -> dict:
     }
 
 
-def threshold_sweep_rows(calib: pd.DataFrame, test: pd.DataFrame, fold, task) -> list[dict]:
+def _meta_from_group(g: pd.DataFrame) -> dict:
+    """Stable metadata copied into metric rows for readability."""
+    meta = {}
+    for col in ["task_family", "paper_comparable", "positive_class"]:
+        if col in g.columns:
+            vals = g[col].dropna().unique().tolist()
+            if len(vals) == 1:
+                meta[col] = vals[0]
+    return meta
+
+
+def _group_cols(events: pd.DataFrame) -> list[str]:
+    """Group metrics by task and score variant, with fold when present."""
+    cols = ["fold", "task"]
+    if "score_variant" in events.columns:
+        cols.append("score_variant")
+    return cols
+
+
+def threshold_sweep_rows(calib: pd.DataFrame, test: pd.DataFrame, group: dict) -> list[dict]:
     """Return calibration and test metrics over the calibration threshold grid."""
     rows = []
+    meta = _meta_from_group(calib if not calib.empty else test)
 
     for t in threshold_candidates(calib["score"]):
         for split_name, split_df in [("calib", calib), ("test", test)]:
             m = metric_dict(split_df, float(t))
-            m.update({"fold": fold, "task": task, "split": split_name})
+            m.update(group)
+            m.update(meta)
+            m["split"] = split_name
             rows.append(m)
 
     return rows
 
 
-def objective_threshold_rows(calib: pd.DataFrame, test: pd.DataFrame, fold, task) -> list[dict]:
+def objective_threshold_rows(calib: pd.DataFrame, test: pd.DataFrame, group: dict) -> list[dict]:
     """Evaluate test metrics using thresholds selected by several calibration objectives."""
     rows = []
+    meta = _meta_from_group(calib if not calib.empty else test)
 
     for objective in DEFAULT_OBJECTIVES:
         t, calib_value = choose_threshold(calib["label"], calib["score"], objective=objective)
         m = metric_dict(test, t)
+        m.update(group)
+        m.update(meta)
         m.update({
-            "fold": fold,
-            "task": task,
             "threshold_objective": objective,
             "calib_objective_value": calib_value,
         })
@@ -167,7 +195,6 @@ def make_val_folds(keys: list[str], k: int = 5, seed: int = 42) -> pd.DataFrame:
                 "fold": fold_id,
                 "split": "test" if key in test else "calib",
             })
-
     return pd.DataFrame(rows)
 
 
@@ -202,7 +229,6 @@ def build_protocol_rows(events: pd.DataFrame, cfg: dict, protocol: str) -> tuple
                 "dev_to_test requires both val and test event rows. "
                 f"Found val/calib interactions={n_calib}, test interactions={n_test}."
             )
-
         return rows, "calib", "test"
 
     raise ValueError(f"Unknown protocol: {protocol}")
@@ -213,8 +239,12 @@ def protocol_split_counts(rows: pd.DataFrame) -> pd.DataFrame:
     if rows.empty:
         return pd.DataFrame()
 
+    cols = ["task", "split"]
+    if "score_variant" in rows.columns:
+        cols.insert(1, "score_variant")
+
     return (
-        rows.groupby(["task", "split"], dropna=False)
+        rows.groupby(cols, dropna=False)
         .agg(
             n_rows=("label", "size"),
             n_interactions=("interaction_key", "nunique"),
@@ -233,13 +263,15 @@ def event_level_metric_rows(eval_rows: pd.DataFrame, thresholds: pd.DataFrame) -
     group_cols = [
         "fold",
         "task",
+        "score_variant",
         "interaction_key",
         "project_split",
         "source_event",
         "event_id",
         "speaker",
         "positive_class",
-        "score_variant",
+        "task_family",
+        "paper_comparable",
     ]
     group_cols = [c for c in group_cols if c in eval_rows.columns]
 
@@ -255,14 +287,19 @@ def event_level_metric_rows(eval_rows: pd.DataFrame, thresholds: pd.DataFrame) -
     )
 
     rows = []
+    key_cols = ["fold", "task"] + (["score_variant"] if "score_variant" in thresholds.columns else [])
     for _, th in thresholds.iterrows():
-        fold = th["fold"]
-        task = th["task"]
         threshold = float(th["threshold"])
 
-        g = ev[(ev["fold"] == fold) & (ev["task"] == task)].copy()
+        g = ev.copy()
+        for col in key_cols:
+            g = g[g[col] == th[col]]
+
         m = metric_dict(g, threshold)
-        m.update({"fold": fold, "task": task, "unit": "event_mean_score"})
+        for col in key_cols:
+            m[col] = th[col]
+        m.update(_meta_from_group(g))
+        m.update({"unit": "event_mean_score"})
         rows.append(m)
 
     return pd.DataFrame(rows)
@@ -284,9 +321,15 @@ def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
     sweep_rows = []
     objective_rows = []
 
-    for (fold, task), g in rows.groupby(["fold", "task"]):
+    group_cols = _group_cols(rows)
+    for key, g in rows.groupby(group_cols, dropna=False):
+        if not isinstance(key, tuple):
+            key = (key,)
+        group = dict(zip(group_cols, key))
+
         calib = g[g["split"] == calib_split]
         test = g[g["split"] == eval_split]
+        meta = _meta_from_group(g)
 
         t, calib_value = choose_threshold(
             calib["label"],
@@ -294,26 +337,29 @@ def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
             objective=PRIMARY_THRESHOLD_OBJECTIVE,
         )
 
-        threshold_rows.append({
-            "fold": fold,
-            "task": task,
+        threshold_row = {
+            **group,
+            **meta,
             "threshold": t,
             "threshold_objective": PRIMARY_THRESHOLD_OBJECTIVE,
             "n_calib_frames": len(calib),
             "best_calib_objective_value": calib_value,
-        })
+        }
+        threshold_rows.append(threshold_row)
 
         m = metric_dict(test, t)
-        m.update({"fold": fold, "task": task})
+        m.update(group)
+        m.update(meta)
         metric_rows.append(m)
 
         tmp = test.copy()
         tmp["threshold"] = t
+        tmp["threshold_objective"] = PRIMARY_THRESHOLD_OBJECTIVE
         tmp["pred"] = (tmp["score"] >= t).astype(int)
         eval_rows_out.append(tmp)
 
-        sweep_rows.extend(threshold_sweep_rows(calib, test, fold, task))
-        objective_rows.extend(objective_threshold_rows(calib, test, fold, task))
+        sweep_rows.extend(threshold_sweep_rows(calib, test, group))
+        objective_rows.extend(objective_threshold_rows(calib, test, group))
 
     thresholds = pd.DataFrame(threshold_rows)
     metrics = pd.DataFrame(metric_rows)
@@ -321,21 +367,12 @@ def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
     threshold_sweep = pd.DataFrame(sweep_rows)
     objective_metrics = pd.DataFrame(objective_rows)
 
-    table = metrics.pivot_table(
-        index="fold",
-        columns="task",
-        values="weighted_f1",
-        aggfunc="first",
-    ).reset_index()
-
-    if not metrics.empty and "S/H" in set(metrics["task"]):
-        sh = metrics[metrics["task"] == "S/H"][["fold", "positive_f1"]].rename(
-            columns={"positive_f1": "S/H_SHIFT"}
-        )
-        table = table.merge(sh, on="fold", how="left")
+    summary_group = ["task"]
+    if "score_variant" in metrics.columns:
+        summary_group.append("score_variant")
 
     summary = (
-        metrics.groupby("task")
+        metrics.groupby(summary_group, dropna=False)
         .agg({
             "weighted_f1": ["mean", "std"],
             "macro_f1": ["mean", "std"],
@@ -355,22 +392,23 @@ def evaluate(cfg: dict, protocol: str = "dev_to_test") -> None:
     split_counts = protocol_split_counts(rows)
     event_metrics = event_level_metric_rows(eval_rows, thresholds)
 
-    write_csv(out_root / "protocol_split_counts.csv", split_counts)
     write_csv(out_root / "thresholds.csv", thresholds)
     write_csv(out_root / "fold_metrics.csv", metrics)
-    write_csv(out_root / "event_level_metrics.csv", event_metrics)
+    write_csv(out_root / "task_metrics.csv", summary)
+    write_csv(out_root / "protocol_split_counts.csv", split_counts)
     write_csv(out_root / "threshold_sweep.csv", threshold_sweep)
     write_csv(out_root / "objective_threshold_metrics.csv", objective_metrics)
     write_csv(out_root / "event_predictions_eval.csv", eval_rows)
-    write_csv(out_root / "table1_style_by_fold.csv", table)
-    write_csv(out_root / "task_metrics.csv", summary)
-    write_json(out_root / "summary.json", {
+    write_csv(out_root / "event_level_metrics.csv", event_metrics)
+
+    report = {
         "protocol": protocol,
+        "primary_threshold_objective": PRIMARY_THRESHOLD_OBJECTIVE,
+        "objectives_reported": DEFAULT_OBJECTIVES,
         "n_event_rows": int(len(events)),
         "n_protocol_rows": int(len(rows)),
-        "n_eval_rows": int(len(eval_rows)),
-        "threshold_objectives": DEFAULT_OBJECTIVES,
-        "primary_threshold_objective": PRIMARY_THRESHOLD_OBJECTIVE,
-    })
+        "group_cols": group_cols,
+    }
+    write_json(out_root / "metrics_report.json", report)
 
-    print(f"Wrote metrics to {out_root}")
+    print(f"Wrote calibrated metrics to {out_root}")
