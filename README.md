@@ -1,8 +1,27 @@
 # Adaptive VAP Space
 
-`adaptive-vap-space` is a clean research repository for building a reproducible Seamless Interaction → pretrained Voice Activity Projection (VAP) baseline pipeline.
+`adaptive-vap-space` is a research repository for building a reproducible Seamless Interaction → pretrained Voice Activity Projection (VAP) baseline pipeline.
 
 The repository is designed for a later adaptive-VAP project, but it does **not** implement adaptive models yet. First, it creates a trustworthy baseline and diagnostic dataset.
+
+## Current audit branch
+
+The current audit branch is `event-fidelity-v1`.
+
+This branch assumes the 300-interaction datastore and pretrained VAP outputs may already exist from Kaggle. In that case, do **not** rerun VAP. Reuse:
+
+```text
+outputs/vap/vap_manifest.csv
+outputs/vap/predictions/*.json.gz
+```
+
+Then rerun event extraction, metrics, and EDA.
+
+The source-of-truth explanation for the current event/scoring/evaluation logic is:
+
+```text
+docs/EVENT_EXTRACTION_AUDIT.md
+```
 
 ## What this repo does
 
@@ -10,22 +29,24 @@ Pipeline:
 
 1. Read the Seamless Interaction filelist.
 2. Group two participant files by `interaction_key`.
-3. Download audio + VAD + optional transcript for one interaction at a time.
+3. Download audio + Seamless-provided VAD + optional transcript for one interaction at a time.
 4. Validate duration, VAD quality, speaker balance, speech ratio, overlap, and silence.
 5. Build one stereo WAV per kept dyadic interaction.
 6. Assign deterministic train/val/test splits by `interaction_key`.
 7. Run the public pretrained VAP model on each full stereo WAV.
 8. Save VAP `.json.gz` predictions with corruption checks and atomic writes.
-9. Derive VAP-paper-style event rows from VAD.
-10. Evaluate with calibrated thresholds.
-11. Run EDA on dataset quality and VAP errors.
+9. Derive audited event rows from VAD and VAP outputs.
+10. Compute VAP zero-shot score variants, including `paper_256` from the 256-class VAP probabilities.
+11. Evaluate calibrated thresholds per `task × score_variant`.
+12. Run EDA on dataset quality, VAP residuals, event errors, and event attrition.
 
 ## What this repo does not do yet
 
 - It does not download video.
 - It does not train or fine-tune full VAP.
 - It does not implement adaptive VAP models yet.
-- It does not claim BC-pred/S-L reconstruction is publication-final without audit.
+- It does not claim exact paper reproduction on the paper's original datasets.
+- It separates paper-comparable tasks from exploratory adaptation-motivated tasks.
 
 ## Quick local setup
 
@@ -62,6 +83,7 @@ python scripts/10_build_datastore.py --config configs/local_debug.yaml
 python scripts/20_run_vap.py --config configs/local_debug.yaml
 python scripts/30_extract_events.py --config configs/local_debug.yaml
 python scripts/40_eval_calibrated.py --config configs/local_debug.yaml --protocol val_5fold
+python scripts/40_eval_calibrated.py --config configs/local_debug.yaml --protocol dev_to_test
 python scripts/50_eda_dataset.py --config configs/local_debug.yaml
 python scripts/51_eda_vap_errors.py --config configs/local_debug.yaml
 python scripts/52_eda_event_errors.py --config configs/local_debug.yaml
@@ -74,7 +96,7 @@ Edit `configs/datastore.yaml`, especially:
 ```yaml
 dataset:
   target_kept_interactions: 300
-  max_candidate_interactions: 3000
+  max_candidate_interactions: 2500
 filters:
   min_duration_sec: 180
 ```
@@ -86,6 +108,19 @@ python scripts/10_build_datastore.py --config configs/datastore.yaml
 ```
 
 The builder is storage-safe: rejected candidate files are downloaded into `_staging/`, logged, and deleted unless `storage.keep_rejected_downloads: true`.
+
+## Reusing existing Kaggle VAP outputs
+
+If the datastore and `outputs/vap` already exist from Kaggle, the audit rerun starts here:
+
+```bash
+python scripts/30_extract_events.py --config configs/datastore.yaml
+python scripts/40_eval_calibrated.py --config configs/datastore.yaml --protocol val_5fold
+python scripts/40_eval_calibrated.py --config configs/datastore.yaml --protocol dev_to_test
+python scripts/50_eda_dataset.py --config configs/datastore.yaml
+python scripts/51_eda_vap_errors.py --config configs/datastore.yaml
+python scripts/52_eda_event_errors.py --config configs/datastore.yaml
+```
 
 ## Saving space
 
@@ -130,6 +165,9 @@ outputs/
   vap/predictions/
   vap/vap_manifest.csv
   events/event_predictions.csv
+  events/event_summary.csv
+  events/event_attrition.csv
+  events/score_subsets.json
   metrics/
   eda/
 ```
@@ -137,6 +175,8 @@ outputs/
 ## Kaggle workflow
 
 Use Kaggle CPU for dataset building, then save `data/datastore` as a private Kaggle Dataset. Use Kaggle GPU for VAP inference.
+
+For the current audit, the preferred workflow is to attach the existing datastore and VAP-output datasets, clone this branch, and rerun only extraction/metrics/EDA.
 
 See `docs/KAGGLE.md`.
 
@@ -148,6 +188,8 @@ See `docs/KAGGLE.md`.
 - Every rejection has a reason.
 - Paths in manifests are relative where possible.
 - Thresholds are chosen on calibration data, never held-out rows.
+- Metrics are reported per `task × score_variant` so paper-style and diagnostic scores are not mixed.
+- `S-pred-overlap` is exploratory and should not be reported as paper-comparable.
 
 ## Local setup
 
