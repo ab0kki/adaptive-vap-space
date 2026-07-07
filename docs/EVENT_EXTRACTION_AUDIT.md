@@ -1,280 +1,565 @@
 # Event Extraction and VAP Baseline Audit
 
-## Purpose
+## Read this first
 
-This branch resets the event-extraction and evaluation pipeline for the pretrained discrete VAP baseline. The goal is not to train adaptation yet. The goal is to create a transparent, auditable baseline that can later support intra-interaction or speaker-level adaptation experiments.
+This is the single audit document for the `event-fidelity-v1` branch.
 
-The repository already supports a 300-interaction Seamless datastore and already stores VAP outputs from the pretrained model under `outputs/vap`. The intended audit workflow is to reuse those existing VAP `.json.gz` files, rerun event extraction, rerun calibrated metrics, and rerun EDA in a new Kaggle notebook.
+The branch is for **baseline reconstruction and audit**, not adaptation training. It assumes that a 300-interaction Seamless datastore already exists and that pretrained VAP has already been run in Kaggle, producing:
 
-## Source grounding
+```text
+outputs/vap/vap_manifest.csv
+outputs/vap/predictions/*.json.gz
+```
 
-The implementation is grounded in:
+The audit notebook should **reuse those VAP outputs** and rerun only:
 
-1. The VAP paper, which evaluates zero-shot turn-taking projections for S/H, S-pred, BC-pred, and S/L using the discrete 256-state VAP model.
-2. The `VoiceActivityProjection` repository, which runs the pretrained VAP model and exports `probs`, `p_now`, and `p_future`.
-3. The `vap_turn_taking` event and metric code, which defines dialog states, shift/hold/backchannel masks, non-shift negatives, and VAP score subsets.
+```bash
+python scripts/30_extract_events.py --config configs/datastore.yaml
+python scripts/40_eval_calibrated.py --config configs/datastore.yaml --protocol val_5fold
+python scripts/40_eval_calibrated.py --config configs/datastore.yaml --protocol dev_to_test
+python scripts/50_eda_dataset.py --config configs/datastore.yaml
+python scripts/51_eda_vap_errors.py --config configs/datastore.yaml
+python scripts/52_eda_event_errors.py --config configs/datastore.yaml
+```
 
-## Input representation
+Do not rerun VAP unless the VAP prediction files are missing or corrupt.
 
-For each interaction, the pipeline reads:
+## What changed in this audit patch
 
-- Seamless-provided speaker A VAD JSONL.
-- Seamless-provided speaker B VAD JSONL.
-- VAP prediction arrays:
-  - `probs`: frame-level 256-state VAP distribution.
-  - `p_now`: exported near-future/current next-speaker diagnostic.
-  - `p_future`: exported later-future next-speaker diagnostic.
+This patch changed five things:
 
-The repository does not generate its own VAD. It uses the VAD metadata provided by Seamless Interaction.
+1. Added `src/adaptive_vap_space/vap_scores.py`.
+   - This reconstructs VAP zero-shot task scores from the 256-class `probs` array.
+   - These are labeled `score_variant = paper_256`.
 
-The VAD segments are converted to a frame-level two-speaker activity matrix at 50 Hz:
+2. Rewrote `src/adaptive_vap_space/events.py`.
+   - It now separates dialogue states, event definitions, score-row construction, and attrition reporting.
+   - It writes paper-comparable tasks and one exploratory overlap task.
 
-    va[t, 0] = speaker A active at frame t
-    va[t, 1] = speaker B active at frame t
+3. Rewrote `src/adaptive_vap_space/metrics.py`.
+   - Metrics are now computed per `task × score_variant`.
+   - The threshold-objective audit still computes weighted F1, macro F1, positive F1, and balanced accuracy.
 
-One frame is 20 ms.
+4. Updated `src/adaptive_vap_space/eda.py`.
+   - EDA summaries preserve `score_variant` when it exists, so paper scores and diagnostic scores are not mixed.
 
-## Dialog states
+5. Updated this document.
+   - It is the source-of-truth explanation of the current audit pipeline.
 
-The frame-level VAD is converted into VAP-style dialog states:
+## Important vocabulary
 
-    0 = only speaker A
-    1 = silence
-    2 = overlap
-    3 = only speaker B
+### Calibration objective / metric variant
 
-Contiguous dialog-state runs are used to extract event candidates.
+A calibration objective answers:
 
-## Paper-comparable versus exploratory tasks
+> Which threshold should be chosen on calibration data?
 
-The branch separates paper-comparable tasks from exploratory adaptation-motivated tasks.
+The current code still audits these calibration objectives:
 
-Paper-comparable tasks:
+```text
+weighted_f1
+macro_f1
+positive_f1
+balanced_accuracy
+```
 
-- `S/H-paper`
-- `S-pred-clear`
-- `BC-pred`
-- `S/L-paper`
+The primary threshold in `thresholds.csv` is selected using:
 
-Exploratory task:
+```text
+macro_f1
+```
 
-- `S-pred-overlap`
+The other objectives are still saved in:
 
-`S-pred-overlap` is intentionally not paper-comparable. It exists to audit rapid-gap and overlap speaker changes that matter for HRI/adaptation but are excluded from the paper's clean mutual-silence S/H definition.
+```text
+outputs/metrics/<protocol>/objective_threshold_metrics.csv
+```
 
-## S/H-paper
+### Score variant
 
-`S/H-paper` evaluates SHIFT versus HOLD during mutual silence.
+A score variant answers:
+
+> Which numeric VAP score is being thresholded?
+
+This is different from the calibration objective.
+
+For example, the same `S/H-paper` frame can be evaluated using:
+
+```text
+score_variant = paper_256
+score_variant = diag_p_now
+score_variant = diag_p_future
+```
+
+Each score variant produces its own score column values and its own calibrated metrics. Metrics must be grouped by `task × score_variant`; otherwise the evaluation would mix different definitions of the model score.
+
+## End-to-end repository pipeline
+
+### 1. Datastore build
+
+Script:
+
+```bash
+python scripts/10_build_datastore.py --config configs/datastore.yaml
+```
+
+Main behavior:
+
+- Reads the Seamless Interaction filelist.
+- Groups two participant files by `interaction_key`.
+- Downloads audio, VAD, and optional transcript for one candidate interaction at a time.
+- Validates duration, VAD quality, speaker balance, speech ratio, overlap, and silence.
+- Builds one stereo WAV per kept dyadic interaction.
+- Assigns deterministic train/val/test splits by `interaction_key`.
+
+The repository uses **Seamless-provided VAD metadata**. It does not generate VAD locally.
+
+### 2. Pretrained VAP run
+
+Script:
+
+```bash
+python scripts/20_run_vap.py --config configs/datastore.yaml
+```
+
+Main behavior:
+
+- Calls the public `VoiceActivityProjection/run.py` script on each stereo WAV.
+- Saves VAP `.json.gz` predictions to `outputs/vap/predictions/`.
+- Writes `outputs/vap/vap_manifest.csv`.
+
+Each prediction file contains:
+
+```text
+probs       frame-level 256-state VAP probability distribution
+p_now       exported near/current next-speaker helper probability
+p_future    exported later-future next-speaker helper probability
+```
+
+For the current audit, this stage was already run in Kaggle. The final audit notebook should reuse these files.
+
+### 3. Event extraction and scoring
+
+Script:
+
+```bash
+python scripts/30_extract_events.py --config configs/datastore.yaml
+```
+
+Main behavior:
+
+- Loads `stereo_manifest.csv`.
+- Loads `vap_manifest.csv`.
+- Loads Seamless VAD for speaker A and speaker B.
+- Converts VAD to 50 Hz two-speaker activity frames.
+- Converts activity frames to dialogue states.
+- Extracts paper-comparable events and exploratory overlap events.
+- Computes multiple VAP score variants.
+- Writes event rows, summary rows, and attrition rows.
+
+Outputs:
+
+```text
+outputs/events/event_predictions.csv
+outputs/events/event_summary.csv
+outputs/events/event_attrition.csv
+outputs/events/score_subsets.json
+```
+
+## Dialogue states
+
+Input frame activity:
+
+```text
+va[t, 0] = speaker A active at frame t
+va[t, 1] = speaker B active at frame t
+```
+
+Dialogue states:
+
+```text
+0 = only speaker A
+1 = silence
+2 = overlap
+3 = only speaker B
+```
+
+The code first converts VAD to these states, then uses contiguous state runs to find event templates.
+
+## Paper-comparable event tasks
+
+### S/H-paper
+
+Meaning:
+
+> SHIFT versus HOLD during mutual silence.
 
 Templates:
 
-    A -> silence -> B = SHIFT
-    B -> silence -> A = SHIFT
-    A -> silence -> A = HOLD
-    B -> silence -> B = HOLD
+```text
+A -> silence -> B = SHIFT
+B -> silence -> A = SHIFT
+A -> silence -> A = HOLD
+B -> silence -> B = HOLD
+```
 
 Filters:
 
-- Minimum mutual silence: 150 ms.
-- Pre-offset: 1 second of only the previous speaker before the silence.
-- Post-onset: 1 second of only the next speaker after onset.
-- Evaluation starts 50 ms into the silence.
-- Evaluation lasts 100 ms.
-- The frame must have at least 3 seconds of past context.
-- The frame must have a full 2-second VAP future horizon.
+```text
+minimum mutual silence = 150 ms
+pre-offset = 1 s of only previous speaker
+post-onset = 1 s of only next speaker
+evaluation starts = 50 ms into silence
+evaluation duration = 100 ms
+minimum past context = 3 s
+future horizon required = 2 s
+```
 
-Label convention:
+Labels:
 
-    SHIFT = 1
-    HOLD = 0
+```text
+SHIFT = 1
+HOLD = 0
+```
 
-The score is the probability of SHIFT, meaning the probability that the other speaker will be the next speaker. The primary score variant is `paper_256`.
+Scores written:
 
-## S-pred-clear
+```text
+paper_256      VAP 256-state silence next-speaker subset
+diag_p_now     exported VAP p_now for the shift speaker
+diag_p_future  exported VAP p_future for the shift speaker
+```
 
-`S-pred-clear` evaluates upcoming SHIFT prediction while a speaker is still active.
+### S-pred-clear
 
-Positive examples:
+Meaning:
 
-    500 ms before an `S/H-paper` SHIFT silence.
+> Predict an upcoming clean paper-valid SHIFT while a speaker is still active.
 
-Negative examples:
+Positive windows:
 
-    500 ms windows sampled from non-shift single-speaker regions where the future 2-second horizon remains with the current speaker and is far from future activity of the other speaker.
+```text
+500 ms before an S/H-paper SHIFT silence
+```
 
-Label convention:
+Negative windows:
 
-    SHIFT_SOON = 1
-    sampled non-shift window = 0
+```text
+500 ms sampled from non-shift single-speaker regions
+```
 
-Primary score:
+Labels:
 
-    `paper_256`, using the 256-state active-region VAP subset score.
+```text
+SHIFT_SOON = 1
+sampled non-shift = 0
+```
 
-## S-pred-overlap
+Scores written:
 
-`S-pred-overlap` is exploratory.
+```text
+paper_256      VAP 256-state active-region shift subset
+diag_p_future  exported VAP p_future for the target next speaker
+```
 
-It captures speaker-change events not included in `S/H-paper`:
+### BC-pred
 
-- rapid gap speaker changes with less than 150 ms silence;
-- overlap speaker changes with up to 150 ms overlap.
+Meaning:
 
-It uses the same 500 ms prediction window before the new-speaker/overlap event. It uses strict 1 second pre/post single-speaker checks when possible.
+> Predict an upcoming backchannel.
 
-This task is useful for adaptation/HRI analysis but should not be compared to the VAP paper's S-pred numbers.
+Backchannel definition:
 
-## BC-pred
+```text
+short isolated listener activity
+minimum duration = 200 ms
+maximum duration = 1 s
+same-speaker pre-silence = 1 s
+same-speaker post-silence = 2 s
+last speaker before BC = other speaker
+```
 
-`BC-pred` evaluates prediction of upcoming backchannels.
+Positive windows:
 
-A backchannel event is a short isolated listener activity segment:
+```text
+500 ms before BC onset
+```
 
-- minimum duration: 200 ms;
-- maximum duration: 1 second;
-- no activity by the same speaker in the previous 1 second;
-- no activity by the same speaker in the following 2 seconds;
-- the last speaker before the segment was the other speaker.
+Negative windows:
 
-Positive examples:
+```text
+sampled non-shift windows; silence/listening regions are allowed
+```
 
-    500 ms before BC onset.
+Scores written:
 
-Negative examples:
+```text
+paper_256       VAP 256-state backchannel subset
+diag_approx_bc  previous approximate BC reconstruction, retained only for comparison
+```
 
-    sampled non-shift windows. These may include non-active regions because a backchannel can be predicted during listening/silence.
+### S/L-paper
 
-Primary score:
+Meaning:
 
-    `paper_256`, using the 256-state backchannel subset score.
+> Decide whether a new speaker onset is SHORT/backchannel or LONG/proper shift.
 
-Diagnostic score:
+Examples:
 
-    `diag_approx_bc`, retained only for comparison with the previous branch.
+```text
+SHORT positive = BC onset
+LONG negative = S/H-paper SHIFT onset
+```
 
-## S/L-paper
+Evaluation window:
 
-`S/L-paper` evaluates SHORT versus LONG at onset.
+```text
+first 200 ms after onset
+```
 
-Positive examples:
+Labels:
 
-    SHORT = BC onset.
+```text
+SHORT = 1
+LONG = 0
+```
 
-Negative examples:
+Scores written:
 
-    LONG = `S/H-paper` SHIFT onset.
+```text
+paper_256       VAP 256-state backchannel subset
+diag_approx_bc  previous approximate BC reconstruction, retained only for comparison
+```
 
-Evaluation region:
+## Exploratory task
 
-    first 200 ms after onset.
+### S-pred-overlap
 
-Label convention:
+Meaning:
 
-    SHORT = 1
-    LONG = 0
+> Predict upcoming rapid-gap or overlap speaker changes that are not part of the paper's clean S/H mutual-silence definition.
 
-Primary score:
+Events:
 
-    `paper_256`, using the 256-state backchannel subset score.
+```text
+rapid gap speaker change: less than 150 ms silence
+overlap speaker change: up to 150 ms overlap
+```
 
-## Zero-shot score variants
+Positive windows:
 
-The branch writes multiple score variants to make the audit explicit.
+```text
+500 ms before the rapid-gap or overlap event
+```
 
-Primary paper-style score:
+Negative windows:
 
-- `paper_256`: reconstructed from the 256-class VAP probability vector using task-specific class subsets.
+```text
+sampled non-shift single-speaker regions
+```
 
-Diagnostic scores:
+Scores written:
 
-- `diag_p_now`
-- `diag_p_future`
-- `diag_approx_bc`
+```text
+paper_256      same active-region shift subset as S-pred-clear
+diag_p_future  exported VAP p_future for the target next speaker
+```
 
-Only `paper_256` should be used for paper-comparable baseline claims. Diagnostic scores are included to understand how exported VAP helper arrays differ from the explicit 256-state subsets.
+This task is useful for adaptation/HRI, but it is not paper-comparable.
 
-Rows include:
+## Score variants in detail
 
-    task
-    task_family
-    score_variant
-    paper_comparable
-    source_event
-    positive_class
-    event_id
-    speaker
-    score_speaker
-    frame
-    time_s
-    label
-    score
+### `paper_256`
+
+This is the primary audit score. It is reconstructed from `probs`, the 256-class VAP probability vector.
+
+The helper module writes three arrays:
+
+```text
+p_silence  used for S/H-paper
+p_active   used for S-pred-clear and S-pred-overlap
+p_bc       used for BC-pred and S/L-paper
+```
+
+### `diag_p_now`
+
+Diagnostic only. Uses the exported VAP `p_now` helper array.
+
+Currently written for:
+
+```text
+S/H-paper
+```
+
+### `diag_p_future`
+
+Diagnostic only. Uses the exported VAP `p_future` helper array.
+
+Currently written for:
+
+```text
+S/H-paper
+S-pred-clear
+S-pred-overlap
+```
+
+### `diag_approx_bc`
+
+Diagnostic only. Uses the previous repository's approximate BC reconstruction.
+
+Currently written for:
+
+```text
+BC-pred
+S/L-paper
+```
+
+## Event row schema
+
+`outputs/events/event_predictions.csv` contains one row per evaluation frame per score variant.
+
+Important columns:
+
+```text
+interaction_key      independent interaction id
+project_split        train/val/test split
+task                 S/H-paper, S-pred-clear, S-pred-overlap, BC-pred, S/L-paper
+task_family          paper or exploratory
+score_variant        paper_256 or diagnostic variant
+paper_comparable     true only for paper task + paper_256 score
+label                binary target label
+score                numeric VAP score for this row
+frame                frame index at 50 Hz
+time_s               time in seconds
+speaker              event speaker used for event interpretation
+score_speaker        speaker index used to read score array
+source_event         shift, hold, bc_pred_pos, etc.
+event_id             event identifier within interaction
+positive_class       SHIFT, SHIFT_SOON, BC_SOON, or SHORT
+```
 
 ## Attrition audit
 
-Every extraction run writes:
+`outputs/events/event_attrition.csv` is the key sanity audit for the concern that the code finds fewer shifts than a human hears.
 
-    outputs/events/event_attrition.csv
+It reports counts such as:
 
-This file explains how raw dialogue transitions are filtered into final event definitions. It includes counts for:
+```text
+raw_single_speaker_alternations
+gap_shift_triads
+rapid_gap_shift_triads
+overlap_shift_triads
+gap_shift_min_silence
+gap_shift_pre_ok
+gap_shift_post_ok
+gap_shift_pre_post_ok
+gap_shift_metric_context_ok
+final_shift_events
+final_hold_events
+final_overlap_shift_events
+final_bc_events
+```
 
-- raw single-speaker alternations;
-- gap shift triads;
-- rapid gap shift triads;
-- overlap shift triads;
-- gap shifts passing minimum silence;
-- gap shifts passing pre/post checks;
-- gap shifts passing metric/context checks;
-- final paper SHIFT/HOLD counts;
-- final exploratory overlap-shift counts;
-- final BC counts.
+Interpretation:
 
-This audit is required because paper-valid S/H shifts are not equivalent to all conversational turn trades heard in the audio.
+- If raw alternations are high but final paper shifts are low, the paper's strict event definition is filtering many conversational turn trades.
+- If raw alternations are also low, the Seamless VAD representation may not reflect the turns you heard.
+- If `gap_shift_pre_post_ok` is high but `final_shift_events` is low, that points to a possible implementation bug or context/windowing issue.
 
-## Metrics
+## Evaluation pipeline
 
-Metrics are computed per:
+Scripts:
 
-    task × score_variant
+```bash
+python scripts/40_eval_calibrated.py --config configs/datastore.yaml --protocol val_5fold
+python scripts/40_eval_calibrated.py --config configs/datastore.yaml --protocol dev_to_test
+```
 
-This prevents paper-style scores and diagnostic scores from being mixed.
+Protocols:
 
-The primary threshold-selection objective remains:
+```text
+val_5fold    five folds inside the val split; split by interaction_key
+dev_to_test  calibrate on val, evaluate on test
+```
 
-    macro_f1
+Metrics are grouped by:
 
-The repository also writes objective-threshold audits for:
+```text
+task × score_variant
+```
 
-- weighted_f1
-- macro_f1
-- positive_f1
-- balanced_accuracy
+That means `S/H-paper / paper_256` and `S/H-paper / diag_p_future` are evaluated separately.
 
-This preserves the previous audit notebook behavior while allowing paper-style weighted-F1 thresholds to be inspected from `objective_threshold_metrics.csv`.
+Primary threshold-selection objective:
 
-Evaluation outputs include:
+```text
+macro_f1
+```
 
-- `outputs/metrics/<protocol>/thresholds.csv`
-- `outputs/metrics/<protocol>/fold_metrics.csv`
-- `outputs/metrics/<protocol>/event_level_metrics.csv`
-- `outputs/metrics/<protocol>/threshold_sweep.csv`
-- `outputs/metrics/<protocol>/objective_threshold_metrics.csv`
-- `outputs/metrics/<protocol>/event_predictions_eval.csv`
-- `outputs/metrics/<protocol>/task_metrics.csv`
+Additional threshold-objective audit:
 
-## EDA
+```text
+weighted_f1
+macro_f1
+positive_f1
+balanced_accuracy
+```
 
-EDA preserves `score_variant` where present, so paper-style and diagnostic scores are not silently mixed.
+Output files:
 
-Outputs include:
+```text
+outputs/metrics/<protocol>/thresholds.csv
+outputs/metrics/<protocol>/fold_metrics.csv
+outputs/metrics/<protocol>/event_level_metrics.csv
+outputs/metrics/<protocol>/threshold_sweep.csv
+outputs/metrics/<protocol>/objective_threshold_metrics.csv
+outputs/metrics/<protocol>/event_predictions_eval.csv
+outputs/metrics/<protocol>/task_metrics.csv
+outputs/metrics/<protocol>/protocol_split_counts.csv
+outputs/metrics/<protocol>/metrics_report.json
+```
 
-- `outputs/eda/dataset`
-- `outputs/eda/vap_errors`
-- `outputs/eda/event_errors`
+## EDA pipeline
+
+Scripts:
+
+```bash
+python scripts/50_eda_dataset.py --config configs/datastore.yaml
+python scripts/51_eda_vap_errors.py --config configs/datastore.yaml
+python scripts/52_eda_event_errors.py --config configs/datastore.yaml
+```
+
+EDA outputs preserve `score_variant` where present. This avoids mixing paper scores and diagnostic scores.
+
+Output roots:
+
+```text
+outputs/eda/dataset
+outputs/eda/vap_errors
+outputs/eda/event_errors
+```
+
+## What to inspect first after a Kaggle run
+
+1. `outputs/events/event_attrition.csv`
+   - Check whether raw alternations are much larger than final paper shifts.
+
+2. `outputs/events/event_summary.csv`
+   - Check final event counts per interaction.
+
+3. `outputs/metrics/dev_to_test/fold_metrics.csv`
+   - Filter to `score_variant == paper_256` for main baseline inspection.
+
+4. `outputs/metrics/dev_to_test/objective_threshold_metrics.csv`
+   - Compare weighted-F1, macro-F1, positive-F1, and balanced-accuracy threshold choices.
+
+5. `outputs/eda/event_errors/classification_error_by_source_dev_to_test.csv`
+   - Check which event sources fail most.
 
 ## Known limitations
 
-1. The repository is still a proxy evaluation on Seamless Interaction rather than the exact datasets used in the VAP paper.
-2. Seamless VAD quality directly affects event counts.
+1. This is a proxy VAP baseline on Seamless Interaction, not an exact re-run of the paper's datasets.
+2. Event counts are VAD-dependent.
 3. `S-pred-overlap` is exploratory and must not be reported as paper-comparable.
-4. Threshold-calibrated metrics are diagnostic; paper-comparison should prioritize `paper_256` and inspect weighted-F1 objective rows.
-5. The next audit should visually inspect high-attrition clips and verify a sample of event boundaries against audio.
+4. The primary threshold still uses macro F1 to match the previous audit notebook behavior; paper-style weighted-F1 threshold rows are preserved in the objective audit.
+5. The next qualitative audit should inspect a sample of high-attrition clips against audio.
