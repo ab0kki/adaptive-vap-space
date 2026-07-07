@@ -1,6 +1,8 @@
 """EDA routines that save CSVs and PNGs.
 
 These routines are diagnostic. They do not define training or evaluation labels.
+They preserve ``score_variant`` whenever present so paper-style 256-state scores
+and diagnostic scores are not silently mixed in summaries.
 """
 from __future__ import annotations
 
@@ -34,6 +36,24 @@ def _hist(df: pd.DataFrame, col: str, out_path: Path, title: str) -> None:
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close()
+
+
+def _safe_name(x: object) -> str:
+    return str(x).replace("/", "_").replace(" ", "_").replace(":", "_")
+
+
+def _metric_group_cols(df: pd.DataFrame, base: list[str]) -> list[str]:
+    """Insert score_variant/task metadata into EDA group columns when present."""
+    cols = list(base)
+    if "task" in cols:
+        insert_at = cols.index("task") + 1
+    else:
+        insert_at = 0
+    for col in ["score_variant", "task_family", "paper_comparable"]:
+        if col in df.columns and col not in cols:
+            cols.insert(insert_at, col)
+            insert_at += 1
+    return cols
 
 
 def _load_canonical_splits(root: Path) -> pd.DataFrame:
@@ -178,7 +198,7 @@ def _add_interaction_features(df: pd.DataFrame, root: Path) -> pd.DataFrame:
 
 
 def eda_vap_errors(cfg: dict) -> None:
-    """Analyze residuals over interaction time and speakers."""
+    """Analyze score residuals over interaction time and speakers."""
     root = Path(get(cfg, "dataset.root", "data/datastore"))
     events_csv = Path(get(cfg, "outputs.events_csv", "outputs/events/event_predictions.csv"))
     out = Path(get(cfg, "outputs.eda_root", "outputs/eda")) / "vap_errors"
@@ -190,7 +210,8 @@ def eda_vap_errors(cfg: dict) -> None:
 
     write_csv(out / "residual_rows.csv", df)
 
-    summary = df.groupby(["interaction_key", "task"]).agg(
+    summary_cols = _metric_group_cols(df, ["interaction_key", "task"])
+    summary = df.groupby(summary_cols, dropna=False).agg(
         mean_abs_residual=("abs_residual", "mean"),
         mean_squared_residual=("squared_residual", "mean"),
         n_rows=("label", "size"),
@@ -198,8 +219,9 @@ def eda_vap_errors(cfg: dict) -> None:
     write_csv(out / "interaction_residual_summary.csv", summary)
 
     if "relative_time_bin" in df.columns:
+        rel_cols = _metric_group_cols(df, ["task", "relative_time_bin"])
         rel_summary = (
-            df.groupby(["task", "relative_time_bin"], observed=False)
+            df.groupby(rel_cols, observed=False, dropna=False)
             .agg(
                 mean_abs_residual=("abs_residual", "mean"),
                 mean_squared_residual=("squared_residual", "mean"),
@@ -210,8 +232,9 @@ def eda_vap_errors(cfg: dict) -> None:
         write_csv(out / "relative_time_residual_summary.csv", rel_summary)
 
     if "speaker_id" in df.columns:
+        spk_cols = _metric_group_cols(df, ["task", "speaker_id"])
         speaker_summary = (
-            df.groupby(["task", "speaker_id"], dropna=False)
+            df.groupby(spk_cols, dropna=False)
             .agg(
                 mean_abs_residual=("abs_residual", "mean"),
                 mean_squared_residual=("squared_residual", "mean"),
@@ -223,8 +246,9 @@ def eda_vap_errors(cfg: dict) -> None:
         write_csv(out / "speaker_residual_summary.csv", speaker_summary)
 
     if "interaction_half" in df.columns:
+        half_cols = _metric_group_cols(df, ["task", "interaction_half"])
         half_summary = (
-            df.groupby(["task", "interaction_half"], dropna=False)
+            df.groupby(half_cols, dropna=False)
             .agg(
                 mean_abs_residual=("abs_residual", "mean"),
                 n_rows=("label", "size"),
@@ -233,7 +257,11 @@ def eda_vap_errors(cfg: dict) -> None:
         )
         write_csv(out / "early_late_residual_summary.csv", half_summary)
 
-    for task, g in df.groupby("task"):
+    plot_group_cols = ["task"] + (["score_variant"] if "score_variant" in df.columns else [])
+    for key, g in df.groupby(plot_group_cols, dropna=False):
+        if not isinstance(key, tuple):
+            key = (key,)
+        label = "_".join(_safe_name(x) for x in key)
         plt.figure()
         if "relative_time" in g.columns:
             bins = pd.cut(g["relative_time"], bins=20, include_lowest=True)
@@ -243,13 +271,13 @@ def eda_vap_errors(cfg: dict) -> None:
             xlabel = "time bin"
         binned = g.groupby(bins, observed=False)["abs_residual"].mean()
         binned.plot(kind="line")
-        plt.title(f"Mean abs residual over time: {task}")
+        plt.title(f"Mean abs residual over time: {label}")
         plt.xlabel(xlabel)
         plt.ylabel("mean abs residual")
         plt.xticks(rotation=45, ha="right")
         plt.tight_layout()
         (out / "plots").mkdir(parents=True, exist_ok=True)
-        plt.savefig(out / "plots" / f"time_residual_{task.replace('/', '_')}.png")
+        plt.savefig(out / "plots" / f"time_residual_{label}.png")
         plt.close()
 
     print(f"Wrote VAP error EDA to {out}")
@@ -270,8 +298,9 @@ def _feature_bin_errors(ev: pd.DataFrame, out: Path, protocol: str) -> None:
         tmp = ev.copy()
         tmp["feature"] = feature
         tmp["feature_bin"] = bins.astype(str)
+        group_cols = _metric_group_cols(tmp, ["task", "feature", "feature_bin"])
         g = (
-            tmp.groupby(["task", "feature", "feature_bin"], dropna=False)
+            tmp.groupby(group_cols, dropna=False)
             .agg(
                 n_rows=("label", "size"),
                 n_interactions=("interaction_key", "nunique"),
@@ -294,7 +323,8 @@ def eda_event_errors(cfg: dict) -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     df = add_residual_columns(pd.read_csv(events_csv))
-    summary = df.groupby(["task", "source_event"]).agg(
+    summary_cols = _metric_group_cols(df, ["task", "source_event"])
+    summary = df.groupby(summary_cols, dropna=False).agg(
         mean_abs_residual=("abs_residual", "mean"),
         mean_squared_residual=("squared_residual", "mean"),
         n_rows=("label", "size"),
@@ -316,8 +346,9 @@ def eda_event_errors(cfg: dict) -> None:
         ev = _add_speaker_ids(ev, root)
         ev = _add_interaction_features(ev, root)
 
+        cls_cols = _metric_group_cols(ev, ["task", "source_event"])
         cls = (
-            ev.groupby(["task", "source_event"], dropna=False)
+            ev.groupby(cls_cols, dropna=False)
             .agg(
                 n_rows=("label", "size"),
                 n_interactions=("interaction_key", "nunique"),
@@ -330,16 +361,14 @@ def eda_event_errors(cfg: dict) -> None:
         )
         write_csv(out / f"classification_error_by_source_{protocol}.csv", cls)
 
-        cm = (
-            ev.groupby(["task", "source_event", "label", "pred"], dropna=False)
-            .size()
-            .reset_index(name="n_rows")
-        )
+        cm_cols = _metric_group_cols(ev, ["task", "source_event", "label", "pred"])
+        cm = ev.groupby(cm_cols, dropna=False).size().reset_index(name="n_rows")
         write_csv(out / f"classification_confusion_by_source_{protocol}.csv", cm)
 
         if "relative_time_bin" in ev.columns:
+            rel_cols = _metric_group_cols(ev, ["task", "relative_time_bin"])
             rel = (
-                ev.groupby(["task", "relative_time_bin"], observed=False)
+                ev.groupby(rel_cols, observed=False, dropna=False)
                 .agg(
                     n_rows=("label", "size"),
                     n_interactions=("interaction_key", "nunique"),
@@ -352,8 +381,9 @@ def eda_event_errors(cfg: dict) -> None:
             write_csv(out / f"classification_error_by_relative_time_{protocol}.csv", rel)
 
         if "interaction_half" in ev.columns:
+            half_cols = _metric_group_cols(ev, ["task", "interaction_half"])
             half = (
-                ev.groupby(["task", "interaction_half"], dropna=False)
+                ev.groupby(half_cols, dropna=False)
                 .agg(
                     n_rows=("label", "size"),
                     n_interactions=("interaction_key", "nunique"),
@@ -366,8 +396,9 @@ def eda_event_errors(cfg: dict) -> None:
             write_csv(out / f"classification_error_early_late_{protocol}.csv", half)
 
         if "speaker_id" in ev.columns:
+            spk_cols = _metric_group_cols(ev, ["task", "speaker_id"])
             spk = (
-                ev.groupby(["task", "speaker_id"], dropna=False)
+                ev.groupby(spk_cols, dropna=False)
                 .agg(
                     n_rows=("label", "size"),
                     n_interactions=("interaction_key", "nunique"),
@@ -379,8 +410,9 @@ def eda_event_errors(cfg: dict) -> None:
             )
             write_csv(out / f"classification_error_by_speaker_{protocol}.csv", spk)
 
+        per_cols = _metric_group_cols(ev, ["task", "interaction_key"])
         per_interaction = (
-            ev.groupby(["task", "interaction_key"], dropna=False)
+            ev.groupby(per_cols, dropna=False)
             .agg(
                 n_rows=("label", "size"),
                 error_rate=("is_error", "mean"),
