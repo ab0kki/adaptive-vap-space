@@ -19,6 +19,17 @@ Protocols:
         Uses val as the calibration/dev split and test as the held-out evaluation
         split. This is the default because it matches normal ML discipline:
         choose thresholds/hyperparameters on dev, then evaluate once on test.
+
+Metric grouping:
+    Metrics are computed separately for each ``task × score_variant`` pair. This
+    is required because event extraction writes both the primary paper-style
+    ``paper_256`` score and diagnostic scores such as ``diag_p_future``.
+
+Calibration objectives:
+    The primary threshold in ``thresholds.csv`` is selected by macro F1 to match
+    the audit notebook behavior. The script also writes
+    ``objective_threshold_metrics.csv`` so weighted F1, macro F1, positive F1,
+    and balanced accuracy threshold choices can all be inspected.
 """
 from __future__ import annotations
 import argparse
