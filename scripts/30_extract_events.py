@@ -10,14 +10,21 @@ Inputs:
         Interaction metadata, split labels, and relative paths to Seamless VAD.
 
     outputs/vap/vap_manifest.csv
-        One row per VAP prediction file.
+        One row per VAP prediction file. The extraction runner resolves paths
+        robustly because attached Kaggle output datasets can contain stale
+        absolute paths from a previous notebook run.
 
     outputs/vap/predictions/*.json.gz
         VAP outputs containing ``probs``, ``p_now``, and ``p_future``.
 
 Core logic:
     See ``src/adaptive_vap_space/events.py`` for dialogue-state extraction,
-    event definitions, score-row construction, and attrition reporting.
+    event definitions, and score-row construction.
+
+Manifest/path handling:
+    See ``src/adaptive_vap_space/event_extraction.py``. Extraction is based on
+    whether prediction files resolve and load, not on a narrow whitelist of
+    manifest status strings.
 
 Outputs:
     outputs/events/event_predictions.csv
@@ -32,11 +39,14 @@ Outputs:
 
     outputs/events/score_subsets.json
         Sizes of the 256-state VAP score subsets used by ``paper_256``.
+
+    outputs/events/skipped_interactions.csv
+        Rows skipped because prediction/VAD files could not be resolved or loaded.
 """
 from __future__ import annotations
 import argparse
 from adaptive_vap_space.config import load_config
-from adaptive_vap_space.events import extract_events
+from adaptive_vap_space.event_extraction import extract_events
 
 
 def main() -> None:
