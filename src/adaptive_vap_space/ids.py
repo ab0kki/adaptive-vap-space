@@ -1,4 +1,4 @@
-"""Seamless Interaction identifier parsing.
+r"""Seamless Interaction identifier parsing.
 
 The old working downloader used a regex like
 `V\d+_S\d+_I\d+_P[0-9A-Za-z]+`. This module keeps that behavior but returns a
